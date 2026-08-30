@@ -262,14 +262,21 @@ export const addComment = async (taskId: string, authorId: string | null, body: 
 }
 
 export const awardAnimalForOwner = async (ownerId: string): Promise<Animal> => {
-  const { count, error: countError } = await supabase
+  const { data: existingAnimals, error: existingError } = await supabase
     .from('animals')
-    .select('*', { count: 'exact', head: true })
+    .select('*')
     .eq('owner_id', ownerId)
-  if (countError) throw countError
+    .order('awarded_at', { ascending: true })
 
-  const sequence = count ?? 0
-  const base = ANIMAL_POOL[sequence % ANIMAL_POOL.length]
+  if (existingError) throw existingError
+
+  const ownedSpecies = new Set((existingAnimals ?? []).map((animal) => animal.species))
+  const remainingSpecies = ANIMAL_POOL.filter((base) => !ownedSpecies.has(base.species))
+  const poolForSelection = remainingSpecies.length ? remainingSpecies : [...ANIMAL_POOL]
+
+  const randomIndex = Math.floor(Math.random() * poolForSelection.length)
+  const base = poolForSelection[randomIndex]
+  const sequence = (existingAnimals ?? []).length
   const cycle = Math.floor(sequence / ANIMAL_POOL.length)
   const suffix = cycle > 0 ? ` ${toRoman(cycle + 1)}` : ''
 

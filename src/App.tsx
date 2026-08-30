@@ -7,7 +7,6 @@ import {
   addSubtask,
   addTask,
   awardAnimalForOwner,
-  completeTaskAndAwardAnimal,
   deleteSubtask,
   deleteTask,
   fetchAppData,
@@ -59,6 +58,23 @@ const buildMemberIndex = (assignments: Array<{ task_id?: string; subtask_id?: st
     map.set(entityId, existing)
   }
   return map
+}
+
+const formatAnimalToast = (animals: Animal[]) => {
+  if (!animals.length) return ''
+  const names = animals.map((animal) => animal.display_name)
+  if (names.length === 1) return `${names[0]} joined the zoo!`
+  if (names.length === 2) return `${names[0]} and ${names[1]} joined the zoo!`
+  return `${names.slice(0, -1).join(', ')}, and ${names[names.length - 1]} joined the zoo!`
+}
+
+const awardAnimalsToMembers = async (memberIds: string[]) => {
+  const uniqueMemberIds = Array.from(new Set(memberIds))
+  const rewards: Animal[] = []
+  for (const memberId of uniqueMemberIds) {
+    rewards.push(await awardAnimalForOwner(memberId))
+  }
+  return rewards
 }
 
 function App() {
@@ -255,20 +271,29 @@ function App() {
             setSelectedTaskId(null)
           }}
           onComplete={async () => {
-            if (!currentMember) return
-            const animal = await completeTaskAndAwardAnimal(selectedTask.id, currentMember.id)
-            const earned = ANIMAL_POOL.find((item) => item.species === animal.species)
-            setToast(`🎉 ${animal.display_name} joined the zoo! ${earned?.emoji ?? ''}`)
+            const assigneeIds = taskAssigneeMap.get(selectedTask.id) ?? []
+            if (!assigneeIds.length) {
+              await updateTask(selectedTask.id, { status: 'complete' })
+              return
+            }
+
+            await updateTask(selectedTask.id, { status: 'complete' })
+            const earnedAnimals = await awardAnimalsToMembers(assigneeIds)
+            if (!earnedAnimals.length) return
+            setToast(`🎉 ${formatAnimalToast(earnedAnimals)}`)
           }}
           onAddSubtask={async (title, memberIds) => addSubtask(selectedTask.id, title, memberIds)}
           onToggleSubtask={async (subtask) => {
             const nextDone = !subtask.done
             await updateSubtask(subtask.id, { done: nextDone })
-            if (nextDone && currentMember) {
-              const animal = await awardAnimalForOwner(currentMember.id)
-              const earned = ANIMAL_POOL.find((item) => item.species === animal.species)
-              setToast(`🎉 ${animal.display_name} joined the zoo! ${earned?.emoji ?? ''}`)
-            }
+            if (!nextDone) return
+
+            const assigneeIds = subtaskAssigneeMap.get(subtask.id) ?? []
+            if (!assigneeIds.length) return
+
+            const earnedAnimals = await awardAnimalsToMembers(assigneeIds)
+            if (!earnedAnimals.length) return
+            setToast(`🎉 ${formatAnimalToast(earnedAnimals)}`)
           }}
           onAssignSubtask={async (subtaskId, memberIds) => { await setSubtaskAssignees(subtaskId, memberIds) }}
           onAddComment={async (body) => addComment(selectedTask.id, currentMember?.id ?? null, body)}
@@ -539,39 +564,6 @@ function ZooPen({ animals, onSelect }: { animals: Animal[]; onSelect: (animal: A
   )
 }
 
-function DriftingAnimal({ animal, index, staticMode, onSelect }: { animal: Animal; index: number; staticMode: boolean; onSelect: (animal: Animal) => void }) {
-  const [tick, setTick] = useState(0)
-
-  useEffect(() => {
-    if (staticMode) return
-    let frame = 0
-    let raf = 0
-    const loop = () => {
-      frame += 1
-      if (frame % 5 === 0) setTick((value) => value + 1)
-      raf = requestAnimationFrame(loop)
-    }
-    raf = requestAnimationFrame(loop)
-    return () => cancelAnimationFrame(raf)
-  }, [staticMode])
-
-  const base = ANIMAL_POOL.find((item) => item.species === animal.species) ?? ANIMAL_POOL[0]
-  const x = 10 + ((index * 29 + tick * (0.05 + (index % 3) * 0.02)) % 78)
-  const y = 12 + ((index * 21 + tick * (0.03 + (index % 4) * 0.015)) % 66)
-
-  return (
-    <button
-      type="button"
-      className="absolute rounded-full bg-white/70 px-3 py-2 text-2xl shadow"
-      style={{ transform: `translate(${x}%, ${y}%)` }}
-      onClick={() => onSelect(animal)}
-      aria-label={animal.display_name}
-    >
-      {base.emoji}
-    </button>
-  )
-}
-
 function EmojiPicker({ label, value, onChange }: { label: string; value: string; onChange: (next: string) => void }) {
   const [isOpen, setIsOpen] = useState(false)
   const [customValue, setCustomValue] = useState(value)
@@ -755,13 +747,49 @@ function TaskDetail({
   const [subtaskAssigneeIds, setSubtaskAssigneeIds] = useState<string[]>([])
   const [isEditingSubtaskId, setIsEditingSubtaskId] = useState<string | null>(null)
   const [editingSubtaskTitle, setEditingSubtaskTitle] = useState('')
+  const [activeSubtaskPickerId, setActiveSubtaskPickerId] = useState<string | null>(null)
+  const [activeNewSubtaskPicker, setActiveNewSubtaskPicker] = useState(false)
+  const subtaskPickerRef = useRef<HTMLDivElement | null>(null)
+  const newSubtaskPickerRef = useRef<HTMLDivElement | null>(null)
+
+  useEffect(() => {
+    if (!activeSubtaskPickerId && !activeNewSubtaskPicker) return
+
+    const onPointerDown = (event: MouseEvent) => {
+      const target = event.target as Node
+      const clickedInsideSubtask = activeSubtaskPickerId && subtaskPickerRef.current && subtaskPickerRef.current.contains(target)
+      const clickedInsideNew = activeNewSubtaskPicker && newSubtaskPickerRef.current && newSubtaskPickerRef.current.contains(target)
+      if (!clickedInsideSubtask && !clickedInsideNew) {
+        setActiveSubtaskPickerId(null)
+        setActiveNewSubtaskPicker(false)
+      }
+    }
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setActiveSubtaskPickerId(null)
+        setActiveNewSubtaskPicker(false)
+      }
+    }
+
+    window.addEventListener('mousedown', onPointerDown)
+    window.addEventListener('keydown', onKeyDown)
+    return () => {
+      window.removeEventListener('mousedown', onPointerDown)
+      window.removeEventListener('keydown', onKeyDown)
+    }
+  }, [activeSubtaskPickerId, activeNewSubtaskPicker])
+
+  const handleSaveAndClose = async () => {
+    await onSave(title, description, emoji || '🧩')
+    onClose()
+  }
 
   return (
     <div className="fixed inset-0 z-30 grid place-items-center bg-slate-950/40 p-3">
       <section className="max-h-[95vh] w-full max-w-2xl overflow-y-auto rounded-2xl bg-white p-4 shadow-xl">
         <div className="mb-3 flex items-center justify-between">
           <h2 className="text-lg font-semibold">Task detail</h2>
-          <button aria-label="Close detail" type="button" className="rounded-lg border px-3 py-1" onClick={onClose}>Close</button>
         </div>
 
         <div className="grid gap-2">
@@ -771,10 +799,8 @@ function TaskDetail({
             <p className="mb-2 text-xs font-medium uppercase tracking-wide text-slate-500">Assignees</p>
             <MemberAssignmentSelector members={members} selectedMemberIds={taskAssigneeIds} onChange={(next) => { void onAssign(next) }} />
           </div>
-          <div className="grid grid-cols-[auto_auto_auto] items-center gap-2">
+          <div className="flex items-center justify-start">
             <EmojiPicker label="Task emoji" value={emoji} onChange={setEmoji} />
-            <button type="button" className="rounded-lg border px-3 py-2" onClick={onClose}>Close</button>
-            <button type="button" className="rounded-lg bg-slate-800 px-3 py-2 text-white" onClick={() => void onSave(title, description, emoji || '🧩')}>Save</button>
           </div>
 
           <div className="flex flex-wrap gap-2">
@@ -788,7 +814,6 @@ function TaskDetail({
             <ul className="space-y-2">
               {subtasks.map((subtask) => {
                 const selectedSubtaskIds = subtaskAssigneeMap.get(subtask.id) ?? []
-                const assignedNames = selectedSubtaskIds.map((memberId) => memberById.get(memberId)?.name).filter(Boolean) as string[]
                 return (
                   <li key={subtask.id} className="grid gap-2 rounded-lg border p-2">
                     <div className="grid grid-cols-[auto_1fr_auto] items-center gap-2">
@@ -800,16 +825,53 @@ function TaskDetail({
                       )}
                       {subtask.done ? <span className="text-emerald-600">✔</span> : <span className="text-slate-400">•</span>}
                     </div>
-                    <div className="ml-6 text-xs text-slate-600">
-                      {assignedNames.length ? assignedNames.join(', ') : 'Unassigned'}
-                    </div>
                     <div className="ml-6">
-                      <MemberAssignmentSelector
-                        members={members}
-                        selectedMemberIds={selectedSubtaskIds}
-                        onChange={(next) => { void onAssignSubtask(subtask.id, next) }}
-                        compact
-                      />
+                      {selectedSubtaskIds.length ? (
+                        <div className="mb-2 flex flex-wrap gap-2">
+                          {selectedSubtaskIds.map((memberId) => {
+                            const member = memberById.get(memberId)
+                            if (!member) return null
+                            return (
+                              <span key={member.id} className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2 py-1 text-xs">
+                                <span>{member.avatar_emoji}</span>
+                                <span>{member.name}</span>
+                                <button
+                                  type="button"
+                                  className="ml-1 text-slate-500 hover:text-slate-700"
+                                  aria-label={`Remove ${member.name}`}
+                                  onClick={() => {
+                                    const nextIds = selectedSubtaskIds.filter((id) => id !== member.id)
+                                    void onAssignSubtask(subtask.id, nextIds)
+                                  }}
+                                >
+                                  ×
+                                </button>
+                              </span>
+                            )
+                          })}
+                        </div>
+                      ) : (
+                        <div className="mb-2 text-xs text-slate-500">Unassigned</div>
+                      )}
+
+                      <div className="relative" ref={activeSubtaskPickerId === subtask.id ? subtaskPickerRef : null}>
+                        <button type="button" className="rounded border px-2 py-1 text-xs" onClick={() => setActiveSubtaskPickerId((current) => current === subtask.id ? null : subtask.id)}>
+                          + Add
+                        </button>
+                        {activeSubtaskPickerId === subtask.id ? (
+                          <div className="mt-2 rounded-xl border border-slate-200 bg-white p-2 shadow-lg">
+                            <MemberAssignmentSelector
+                              members={members}
+                              selectedMemberIds={selectedSubtaskIds}
+                              onChange={(next) => { void onAssignSubtask(subtask.id, next) }}
+                              compact
+                            />
+                            <div className="mt-2 flex justify-end">
+                              <button type="button" className="rounded bg-slate-800 px-2 py-1 text-xs text-white" onClick={() => setActiveSubtaskPickerId(null)}>Done</button>
+                            </div>
+                          </div>
+                        ) : null}
+                      </div>
                     </div>
                     <div className="ml-6 flex flex-wrap gap-2">
                       <button type="button" className="rounded bg-emerald-100 px-2 py-1 text-xs font-medium text-emerald-700" onClick={() => void onToggleSubtask(subtask)}>{subtask.done ? 'Mark open' : 'Mark complete'}</button>
@@ -849,9 +911,52 @@ function TaskDetail({
               <input className="min-w-0 flex-1 rounded-lg border px-2 py-1" value={subtaskTitle} onChange={(event) => setSubtaskTitle(event.target.value)} placeholder="Add subtask" />
               <button type="submit" className="rounded-lg border px-2 py-1">Add</button>
             </form>
-            <div className="mt-2 rounded-lg border p-2">
-              <p className="mb-2 text-xs font-medium uppercase tracking-wide text-slate-500">Subtask assignees</p>
-              <MemberAssignmentSelector members={members} selectedMemberIds={subtaskAssigneeIds} onChange={setSubtaskAssigneeIds} compact />
+            <div className="mt-2 rounded-lg border p-2" ref={newSubtaskPickerRef}>
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Subtask assignees</p>
+                <button type="button" className="rounded border px-2 py-1 text-xs" onClick={() => setActiveNewSubtaskPicker((current) => !current)}>
+                  + Add
+                </button>
+              </div>
+
+              {subtaskAssigneeIds.length ? (
+                <div className="mb-2 flex flex-wrap gap-2">
+                  {subtaskAssigneeIds.map((memberId) => {
+                    const member = memberById.get(memberId)
+                    if (!member) return null
+                    return (
+                      <span key={member.id} className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2 py-1 text-xs">
+                        <span>{member.avatar_emoji}</span>
+                        <span>{member.name}</span>
+                        <button
+                          type="button"
+                          className="ml-1 text-slate-500 hover:text-slate-700"
+                          aria-label={`Remove ${member.name}`}
+                          onClick={() => setSubtaskAssigneeIds((current) => current.filter((id) => id !== member.id))}
+                        >
+                          ×
+                        </button>
+                      </span>
+                    )
+                  })}
+                </div>
+              ) : (
+                <div className="mb-2 text-xs text-slate-500">Unassigned</div>
+              )}
+
+              {activeNewSubtaskPicker ? (
+                <div className="rounded-xl border border-slate-200 bg-white p-2 shadow-lg">
+                  <MemberAssignmentSelector
+                    members={members}
+                    selectedMemberIds={subtaskAssigneeIds}
+                    onChange={(next) => setSubtaskAssigneeIds(next)}
+                    compact
+                  />
+                  <div className="mt-2 flex justify-end">
+                    <button type="button" className="rounded bg-slate-800 px-2 py-1 text-xs text-white" onClick={() => setActiveNewSubtaskPicker(false)}>Done</button>
+                  </div>
+                </div>
+              ) : null}
             </div>
           </div>
 
@@ -878,6 +983,11 @@ function TaskDetail({
               <button type="submit" className="rounded-lg border px-2 py-1">Post</button>
             </form>
           </div>
+        </div>
+
+        <div className="mt-4 flex justify-end gap-2 border-t pt-4">
+          <button type="button" className="rounded-lg border px-3 py-2" onClick={onClose}>Close</button>
+          <button type="button" className="rounded-lg bg-slate-800 px-3 py-2 text-white" onClick={() => { void handleSaveAndClose() }}>Save and close</button>
         </div>
       </section>
     </div>

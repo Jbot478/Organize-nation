@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { ANIMAL_POOL } from './animals'
 import { MAP_SLOTS } from './mapSlots'
 import {
@@ -6,10 +6,14 @@ import {
   addMember,
   addSubtask,
   addTask,
+  awardAnimalForOwner,
   completeTaskAndAwardAnimal,
+  deleteSubtask,
   deleteTask,
   fetchAppData,
   removeMember,
+  setSubtaskAssignees,
+  setTaskAssignees,
   subscribeToRealtime,
   unsubscribeFromRealtime,
   updateSubtask,
@@ -39,6 +43,24 @@ const navItems: Array<{ id: Tab; label: string; icon: string }> = [
   { id: 'zoo', label: 'Zoo', icon: '🦁' },
 ]
 
+const buildIdMap = <T extends { id: string }>(items: T[]) => {
+  const map = new Map<string, T>()
+  for (const item of items) map.set(item.id, item)
+  return map
+}
+
+const buildMemberIndex = (assignments: Array<{ task_id?: string; subtask_id?: string; member_id: string }>, key: 'task_id' | 'subtask_id') => {
+  const map = new Map<string, string[]>()
+  for (const assignment of assignments) {
+    const entityId = assignment[key]
+    if (!entityId) continue
+    const existing = map.get(entityId) ?? []
+    existing.push(assignment.member_id)
+    map.set(entityId, existing)
+  }
+  return map
+}
+
 function App() {
   const [tab, setTab] = useState<Tab>('tasks')
   const [members, setMembers] = useState<Member[]>([])
@@ -46,11 +68,16 @@ function App() {
   const [subtasks, setSubtasks] = useState<Subtask[]>([])
   const [comments, setComments] = useState<Comment[]>([])
   const [animals, setAnimals] = useState<Animal[]>([])
+  const [taskAssignments, setTaskAssignments] = useState<Array<{ task_id: string; member_id: string }>>([])
+  const [subtaskAssignments, setSubtaskAssignments] = useState<Array<{ subtask_id: string; member_id: string }>>([])
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null)
   const [selectedMemberId, setSelectedMemberId] = useState<string>('')
   const [errorMessage, setErrorMessage] = useState<string>('')
   const [loading, setLoading] = useState(true)
   const [toast, setToast] = useState<string>('')
+
+  const taskAssigneeMap = useMemo(() => buildMemberIndex(taskAssignments, 'task_id'), [taskAssignments])
+  const subtaskAssigneeMap = useMemo(() => buildMemberIndex(subtaskAssignments, 'subtask_id'), [subtaskAssignments])
 
   const load = async () => {
     try {
@@ -60,6 +87,8 @@ function App() {
       setSubtasks(data.subtasks)
       setComments(data.comments)
       setAnimals(data.animals)
+      setTaskAssignments(data.taskAssignments)
+      setSubtaskAssignments(data.subtaskAssignments)
       setErrorMessage('')
     } catch (error) {
       setErrorMessage('Could not connect to Team Go. Please check Supabase settings and network.')
@@ -122,11 +151,7 @@ function App() {
     return map
   }, [comments])
 
-  const memberById = useMemo(() => {
-    const map = new Map<string, Member>()
-    for (const member of members) map.set(member.id, member)
-    return map
-  }, [members])
+  const memberById = useMemo(() => buildIdMap(members), [members])
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-800">
@@ -172,6 +197,8 @@ function App() {
             <TasksView
               tasks={tasks}
               members={members}
+              taskAssigneeMap={taskAssigneeMap}
+              memberById={memberById}
               subtasksByTask={subtasksByTask}
               onOpenTask={setSelectedTaskId}
               onAddTask={async (input) => addTask(input)}
@@ -182,6 +209,7 @@ function App() {
             <TeamView
               members={members}
               tasks={tasks}
+              taskAssigneeMap={taskAssigneeMap}
               animals={animals}
               onAddMember={async (name, avatar) => addMember(name, avatar)}
               onRemoveMember={async (id) => removeMember(id)}
@@ -213,11 +241,13 @@ function App() {
           task={selectedTask}
           members={members}
           subtasks={subtasksByTask.get(selectedTask.id) ?? []}
+          subtaskAssigneeMap={subtaskAssigneeMap}
           comments={commentsByTask.get(selectedTask.id) ?? []}
           currentMember={currentMember}
           memberById={memberById}
+          taskAssigneeIds={taskAssigneeMap.get(selectedTask.id) ?? []}
           onClose={() => setSelectedTaskId(null)}
-          onAssign={async (memberId) => updateTask(selectedTask.id, { assignee_id: memberId || null })}
+          onAssign={async (memberIds) => { await setTaskAssignees(selectedTask.id, memberIds) }}
           onSave={async (title, description, emoji) => updateTask(selectedTask.id, { title, description, emoji })}
           onCancel={async () => updateTask(selectedTask.id, { status: 'cancelled' })}
           onDelete={async () => {
@@ -230,9 +260,17 @@ function App() {
             const earned = ANIMAL_POOL.find((item) => item.species === animal.species)
             setToast(`🎉 ${animal.display_name} joined the zoo! ${earned?.emoji ?? ''}`)
           }}
-          onAddSubtask={async (title) => addSubtask(selectedTask.id, title, null)}
-          onToggleSubtask={async (subtask) => updateSubtask(subtask.id, { done: !subtask.done })}
-          onAssignSubtask={async (subtaskId, memberId) => updateSubtask(subtaskId, { assignee_id: memberId || null })}
+          onAddSubtask={async (title, memberIds) => addSubtask(selectedTask.id, title, memberIds)}
+          onToggleSubtask={async (subtask) => {
+            const nextDone = !subtask.done
+            await updateSubtask(subtask.id, { done: nextDone })
+            if (nextDone && currentMember) {
+              const animal = await awardAnimalForOwner(currentMember.id)
+              const earned = ANIMAL_POOL.find((item) => item.species === animal.species)
+              setToast(`🎉 ${animal.display_name} joined the zoo! ${earned?.emoji ?? ''}`)
+            }
+          }}
+          onAssignSubtask={async (subtaskId, memberIds) => { await setSubtaskAssignees(subtaskId, memberIds) }}
           onAddComment={async (body) => addComment(selectedTask.id, currentMember?.id ?? null, body)}
         />
       ) : null}
@@ -245,20 +283,24 @@ function App() {
 function TasksView({
   tasks,
   members,
+  taskAssigneeMap,
+  memberById,
   subtasksByTask,
   onOpenTask,
   onAddTask,
 }: {
   tasks: Task[]
   members: Member[]
+  taskAssigneeMap: Map<string, string[]>
+  memberById: Map<string, Member>
   subtasksByTask: Map<string, Subtask[]>
   onOpenTask: (taskId: string) => void
-  onAddTask: (input: { title: string; description: string; assigneeId: string | null; emoji: string }) => Promise<void>
+  onAddTask: (input: { title: string; description: string; assigneeIds: string[]; emoji: string }) => Promise<void>
 }) {
   const [openForm, setOpenForm] = useState(false)
   const [title, setTitle] = useState('')
   const [description, setDescription] = useState('')
-  const [assigneeId, setAssigneeId] = useState('')
+  const [assigneeIds, setAssigneeIds] = useState<string[]>([])
   const [emoji, setEmoji] = useState('🧩')
 
   return (
@@ -275,29 +317,34 @@ function TasksView({
           className="mb-4 grid gap-2 rounded-xl border border-slate-200 p-3"
           onSubmit={async (event) => {
             event.preventDefault()
-            await onAddTask({ title, description, assigneeId: assigneeId || null, emoji: emoji || '🧩' })
+            await onAddTask({ title, description, assigneeIds, emoji: emoji || '🧩' })
             setOpenForm(false)
             setTitle('')
             setDescription('')
-            setAssigneeId('')
+            setAssigneeIds([])
+            setEmoji('🧩')
           }}
         >
           <input required placeholder="Title" className="rounded-lg border px-3 py-2" value={title} onChange={(event) => setTitle(event.target.value)} />
           <textarea placeholder="Description" className="rounded-lg border px-3 py-2" value={description} onChange={(event) => setDescription(event.target.value)} />
-          <div className="grid grid-cols-2 gap-2">
-            <select className="rounded-lg border px-2 py-2" value={assigneeId} onChange={(event) => setAssigneeId(event.target.value)}>
-              <option value="">Unassigned</option>
-              {members.map((member) => <option key={member.id} value={member.id}>{member.avatar_emoji} {member.name}</option>)}
-            </select>
-            <input aria-label="Task emoji" className="rounded-lg border px-2 py-2" value={emoji} maxLength={2} onChange={(event) => setEmoji(event.target.value)} />
+          <div className="grid gap-2 md:grid-cols-[1fr_auto]">
+            <div className="rounded-lg border p-2">
+              <p className="mb-2 text-xs font-medium uppercase tracking-wide text-slate-500">Assign to</p>
+              <MemberAssignmentSelector members={members} selectedMemberIds={assigneeIds} onChange={setAssigneeIds} compact />
+            </div>
+            <EmojiPicker label="Task emoji" value={emoji} onChange={setEmoji} />
           </div>
-          <button type="submit" className="rounded-lg bg-slate-800 px-3 py-2 text-white">Save</button>
+          <div className="flex justify-end gap-2">
+            <button type="button" className="rounded-lg border px-3 py-2" onClick={() => setOpenForm(false)}>Close</button>
+            <button type="submit" className="rounded-lg bg-slate-800 px-3 py-2 text-white">Save</button>
+          </div>
         </form>
       ) : null}
 
       <ul className="space-y-2">
         {tasks.map((task) => {
-          const assignee = members.find((member) => member.id === task.assignee_id)
+          const assigneeIdsForTask = taskAssigneeMap.get(task.id) ?? []
+          const assignees = assigneeIdsForTask.map((memberId) => memberById.get(memberId)).filter((member): member is Member => Boolean(member))
           const taskSubtasks = subtasksByTask.get(task.id) ?? []
           const done = taskSubtasks.filter((item) => item.done).length
           return (
@@ -312,7 +359,7 @@ function TasksView({
                   <div className="text-xs text-slate-500">{done}/{taskSubtasks.length} subtasks</div>
                 </div>
                 <div className="ml-2 flex items-center gap-2 text-sm">
-                  <span>{assignee?.avatar_emoji ?? '🙂'}</span>
+                  <AvatarStack members={assignees} />
                   {task.status === 'complete' ? <span className="text-emerald-600">✔</span> : null}
                 </div>
               </button>
@@ -362,6 +409,7 @@ function MapView({ tasks, onOpenTask }: { tasks: Task[]; onOpenTask: (taskId: st
 function TeamView({
   members,
   tasks,
+  taskAssigneeMap,
   animals,
   onAddMember,
   onRemoveMember,
@@ -369,6 +417,7 @@ function TeamView({
 }: {
   members: Member[]
   tasks: Task[]
+  taskAssigneeMap: Map<string, string[]>
   animals: Animal[]
   onAddMember: (name: string, avatar: string) => Promise<void>
   onRemoveMember: (memberId: string) => Promise<void>
@@ -379,7 +428,7 @@ function TeamView({
   const [avatar, setAvatar] = useState('🙂')
   const [focusedMemberId, setFocusedMemberId] = useState<string>('')
 
-  const focusedTasks = tasks.filter((task) => task.assignee_id === focusedMemberId)
+  const focusedTasks = tasks.filter((task) => (taskAssigneeMap.get(task.id) ?? []).includes(focusedMemberId))
 
   return (
     <section className="rounded-2xl bg-white p-4 shadow-sm">
@@ -402,14 +451,17 @@ function TeamView({
           }}
         >
           <input required className="rounded-lg border px-3 py-2" value={name} onChange={(event) => setName(event.target.value)} placeholder="Name" />
-          <input required className="rounded-lg border px-3 py-2" maxLength={2} value={avatar} onChange={(event) => setAvatar(event.target.value)} placeholder="🙂" />
+          <div className="flex items-center gap-3 rounded-lg border p-2">
+            <span className="text-2xl">{avatar}</span>
+            <EmojiPicker label="Member avatar" value={avatar} onChange={setAvatar} />
+          </div>
           <button type="submit" className="rounded-lg bg-slate-800 px-3 py-2 text-white">Save</button>
         </form>
       ) : null}
 
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
         {members.map((member) => {
-          const openTasks = tasks.filter((task) => task.assignee_id === member.id && task.status === 'open').length
+          const openTasks = tasks.filter((task) => (taskAssigneeMap.get(task.id) ?? []).includes(member.id) && task.status === 'open').length
           const zooCount = animals.filter((animal) => animal.owner_id === member.id).length
           return (
             <article key={member.id} className="rounded-xl border p-3">
@@ -466,13 +518,23 @@ function ZooView({ members, animals, selectedMemberId }: { members: Member[]; an
 }
 
 function ZooPen({ animals, onSelect }: { animals: Animal[]; onSelect: (animal: Animal) => void }) {
-  const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
-
   return (
-    <div className="relative h-72 overflow-hidden rounded-2xl border border-emerald-200 bg-emerald-50">
-      {animals.map((animal, index) => (
-        <DriftingAnimal key={animal.id} animal={animal} index={index} staticMode={reduceMotion} onSelect={onSelect} />
-      ))}
+    <div className="flex flex-wrap gap-3 rounded-2xl border border-emerald-200 bg-emerald-50 p-4">
+      {animals.map((animal) => {
+        const base = ANIMAL_POOL.find((item) => item.species === animal.species) ?? ANIMAL_POOL[0]
+        return (
+          <button
+            key={animal.id}
+            type="button"
+            onClick={() => onSelect(animal)}
+            aria-label={animal.display_name}
+            className="flex w-24 flex-col items-center gap-1 rounded-xl bg-white/80 px-2 py-3 shadow transition hover:scale-105"
+          >
+            <span className="text-3xl">{base.emoji}</span>
+            <span className="w-full truncate text-center text-[11px] text-slate-600">{animal.display_name}</span>
+          </button>
+        )
+      })}
     </div>
   )
 }
@@ -494,8 +556,8 @@ function DriftingAnimal({ animal, index, staticMode, onSelect }: { animal: Anima
   }, [staticMode])
 
   const base = ANIMAL_POOL.find((item) => item.species === animal.species) ?? ANIMAL_POOL[0]
-  const x = 15 + ((index * 23 + tick * (0.05 + (index % 3) * 0.02)) % 70)
-  const y = 15 + ((index * 17 + tick * (0.03 + (index % 4) * 0.015)) % 60)
+  const x = 10 + ((index * 29 + tick * (0.05 + (index % 3) * 0.02)) % 78)
+  const y = 12 + ((index * 21 + tick * (0.03 + (index % 4) * 0.015)) % 66)
 
   return (
     <button
@@ -510,13 +572,151 @@ function DriftingAnimal({ animal, index, staticMode, onSelect }: { animal: Anima
   )
 }
 
+function EmojiPicker({ label, value, onChange }: { label: string; value: string; onChange: (next: string) => void }) {
+  const [isOpen, setIsOpen] = useState(false)
+  const [customValue, setCustomValue] = useState(value)
+  const containerRef = useRef<HTMLDivElement | null>(null)
+
+  useEffect(() => {
+    setCustomValue(value)
+  }, [value])
+
+  useEffect(() => {
+    if (!isOpen) return
+    const onPointerDown = (event: MouseEvent) => {
+      if (containerRef.current && !containerRef.current.contains(event.target as Node)) {
+        setIsOpen(false)
+      }
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setIsOpen(false)
+    }
+    window.addEventListener('mousedown', onPointerDown)
+    window.addEventListener('keydown', onKeyDown)
+    return () => {
+      window.removeEventListener('mousedown', onPointerDown)
+      window.removeEventListener('keydown', onKeyDown)
+    }
+  }, [isOpen])
+
+  const groups: Array<{ title: string; emojis: string[] }> = [
+    { title: 'Places', emojis: ['🏙️', '🌆', '🏔️', '🏕️', '🏖️', '🏝️', '🌋', '🏜️', '🏞️', '🗺️', '🚀', '🚗', '🚲', '🛶', '🏰'] },
+    { title: 'Objects', emojis: ['📚', '🧰', '💡', '🎧', '💻', '🧩', '🪄', '🎁', '🔑', '🧤', '🪑', '🧲', '📦', '🖊️', '🧵'] },
+    { title: 'Nature', emojis: ['🌱', '🌼', '🌳', '🌙', '☀️', '🌊', '🌬️', '🌧️', '❄️', '🔥', '🍀', '🌾', '🌵', '🍃', '🌷'] },
+    { title: 'Activities', emojis: ['⚽', '🏀', '🎯', '🎲', '🎮', '🎸', '🎻', '🎨', '🏃', '🧘', '🎤', '🎭', '🧗', '🚴', '🏊'] },
+    { title: 'Food', emojis: ['🍎', '🍉', '🍓', '🍔', '🌮', '🍕', '🍣', '🍩', '🍰', '🍪', '🥐', '🍜', '🥑', '🍋', '🍇'] },
+    { title: 'Symbols', emojis: ['✅', '⭐', '⚠️', '❌', '💬', '🔔', '💤', '💎', '🎉', '🧠', '❤️', '👍', '👀', '✨', '🏆'] },
+  ]
+
+  const handleCustomCommit = () => {
+    const trimmed = customValue.trim()
+    if (!trimmed) return
+    onChange(trimmed)
+    setIsOpen(false)
+  }
+
+  return (
+    <div ref={containerRef} className="relative">
+      <button
+        type="button"
+        aria-label={label}
+        className="flex h-11 items-center gap-1 rounded-lg border border-slate-300 bg-white px-2 text-xl shadow-sm"
+        onClick={() => setIsOpen((value) => !value)}
+      >
+        <span>{value || '🧩'}</span>
+        <span className="text-xs text-slate-500">▾</span>
+      </button>
+      {isOpen ? (
+        <div className="absolute left-0 z-40 mt-2 w-[320px] rounded-xl border border-slate-200 bg-white p-2 shadow-xl">
+          <div className="mb-2 flex items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 p-2">
+            <span className="text-lg">{customValue || '🧩'}</span>
+            <input
+              aria-label={`${label} custom emoji`}
+              value={customValue}
+              onChange={(event) => setCustomValue(event.target.value)}
+              className="w-full border-none bg-transparent text-sm outline-none"
+              maxLength={4}
+              placeholder="Paste custom emoji"
+            />
+            <button type="button" className="rounded bg-slate-800 px-2 py-1 text-xs text-white" onClick={handleCustomCommit}>Use</button>
+          </div>
+          <div className="max-h-72 overflow-y-auto space-y-3">
+            {groups.map((group) => (
+              <div key={group.title}>
+                <p className="mb-1 px-1 text-[10px] font-semibold uppercase tracking-wide text-slate-500">{group.title}</p>
+                <div className="grid grid-cols-6 gap-1">
+                  {group.emojis.map((emoji) => (
+                    <button
+                      key={`${group.title}-${emoji}`}
+                      type="button"
+                      className={`rounded-md p-1 text-lg hover:bg-slate-100 ${value === emoji ? 'bg-emerald-100 ring-1 ring-emerald-300' : ''}`}
+                      onClick={() => {
+                        onChange(emoji)
+                        setIsOpen(false)
+                      }}
+                      aria-label={emoji}
+                    >
+                      {emoji}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+function MemberAssignmentSelector({ members, selectedMemberIds, onChange, compact = false }: { members: Member[]; selectedMemberIds: string[]; onChange: (next: string[]) => void; compact?: boolean }) {
+  const selectedSet = new Set(selectedMemberIds)
+
+  const toggle = (memberId: string) => {
+    const next = selectedSet.has(memberId)
+      ? selectedMemberIds.filter((id) => id !== memberId)
+      : [...selectedMemberIds, memberId]
+    onChange(next)
+  }
+
+  return (
+    <div className={`grid gap-2 ${compact ? 'grid-cols-2 md:grid-cols-3' : 'sm:grid-cols-2'}`}>
+      {members.map((member) => (
+        <label key={member.id} className="flex cursor-pointer items-center gap-2 rounded-lg border border-slate-200 px-2 py-1 hover:bg-slate-50">
+          <input type="checkbox" checked={selectedSet.has(member.id)} onChange={() => toggle(member.id)} />
+          <span>{member.avatar_emoji} {member.name}</span>
+        </label>
+      ))}
+    </div>
+  )
+}
+
+function AvatarStack({ members }: { members: Member[] }) {
+  const visible = members.slice(0, 3)
+  const rest = members.length - visible.length
+
+  return (
+    <div className="flex items-center -space-x-2">
+      {visible.map((member, index) => (
+        <span key={member.id} className="flex h-7 w-7 items-center justify-center rounded-full border-2 border-white bg-slate-100 text-xs shadow-sm" style={{ zIndex: 10 - index }} title={member.name}>
+          {member.avatar_emoji}
+        </span>
+      ))}
+      {rest > 0 ? <span className="flex h-7 w-7 items-center justify-center rounded-full border-2 border-white bg-slate-200 text-[10px] font-semibold text-slate-700">+{rest}</span> : null}
+      {!members.length ? <span className="text-slate-400">🙂</span> : null}
+    </div>
+  )
+}
+
 function TaskDetail({
   task,
   members,
   subtasks,
+  subtaskAssigneeMap,
   comments,
   currentMember,
   memberById,
+  taskAssigneeIds,
   onClose,
   onAssign,
   onSave,
@@ -531,18 +731,20 @@ function TaskDetail({
   task: Task
   members: Member[]
   subtasks: Subtask[]
+  subtaskAssigneeMap: Map<string, string[]>
   comments: Comment[]
   currentMember: Member | null
   memberById: Map<string, Member>
+  taskAssigneeIds: string[]
   onClose: () => void
-  onAssign: (memberId: string) => Promise<void>
+  onAssign: (memberIds: string[]) => Promise<void>
   onSave: (title: string, description: string, emoji: string) => Promise<void>
   onCancel: () => Promise<void>
   onDelete: () => Promise<void>
   onComplete: () => Promise<void>
-  onAddSubtask: (title: string) => Promise<void>
+  onAddSubtask: (title: string, assigneeIds: string[]) => Promise<void>
   onToggleSubtask: (subtask: Subtask) => Promise<void>
-  onAssignSubtask: (subtaskId: string, memberId: string) => Promise<void>
+  onAssignSubtask: (subtaskId: string, memberIds: string[]) => Promise<void>
   onAddComment: (body: string) => Promise<void>
 }) {
   const [title, setTitle] = useState(task.title)
@@ -550,6 +752,9 @@ function TaskDetail({
   const [emoji, setEmoji] = useState(task.emoji)
   const [subtaskTitle, setSubtaskTitle] = useState('')
   const [commentBody, setCommentBody] = useState('')
+  const [subtaskAssigneeIds, setSubtaskAssigneeIds] = useState<string[]>([])
+  const [isEditingSubtaskId, setIsEditingSubtaskId] = useState<string | null>(null)
+  const [editingSubtaskTitle, setEditingSubtaskTitle] = useState('')
 
   return (
     <div className="fixed inset-0 z-30 grid place-items-center bg-slate-950/40 p-3">
@@ -562,13 +767,14 @@ function TaskDetail({
         <div className="grid gap-2">
           <input className="rounded-lg border px-3 py-2" value={title} onChange={(event) => setTitle(event.target.value)} />
           <textarea className="rounded-lg border px-3 py-2" value={description} onChange={(event) => setDescription(event.target.value)} />
-          <div className="grid grid-cols-[1fr_auto_auto] gap-2">
-            <select className="rounded-lg border px-2 py-2" value={task.assignee_id ?? ''} onChange={(event) => { void onAssign(event.target.value) }}>
-              <option value="">Unassigned</option>
-              {members.map((member) => <option key={member.id} value={member.id}>{member.avatar_emoji} {member.name}</option>)}
-            </select>
-            <input className="w-16 rounded-lg border px-2 py-2" value={emoji} maxLength={2} onChange={(event) => setEmoji(event.target.value)} />
-            <button type="button" className="rounded-lg bg-slate-800 px-3 text-white" onClick={() => void onSave(title, description, emoji || '🧩')}>Save</button>
+          <div className="rounded-xl border p-3">
+            <p className="mb-2 text-xs font-medium uppercase tracking-wide text-slate-500">Assignees</p>
+            <MemberAssignmentSelector members={members} selectedMemberIds={taskAssigneeIds} onChange={(next) => { void onAssign(next) }} />
+          </div>
+          <div className="grid grid-cols-[auto_auto_auto] items-center gap-2">
+            <EmojiPicker label="Task emoji" value={emoji} onChange={setEmoji} />
+            <button type="button" className="rounded-lg border px-3 py-2" onClick={onClose}>Close</button>
+            <button type="button" className="rounded-lg bg-slate-800 px-3 py-2 text-white" onClick={() => void onSave(title, description, emoji || '🧩')}>Save</button>
           </div>
 
           <div className="flex flex-wrap gap-2">
@@ -580,30 +786,73 @@ function TaskDetail({
           <div className="rounded-xl border p-3">
             <h3 className="mb-2 font-semibold">Subtasks</h3>
             <ul className="space-y-2">
-              {subtasks.map((subtask) => (
-                <li key={subtask.id} className="grid grid-cols-[auto_1fr_auto_auto] items-center gap-2">
-                  <input type="checkbox" checked={subtask.done} onChange={() => void onToggleSubtask(subtask)} />
-                  <span className={subtask.done ? 'text-emerald-600' : ''}>{subtask.title}</span>
-                  <select className="rounded border px-1 py-1 text-xs" value={subtask.assignee_id ?? ''} onChange={(event) => { void onAssignSubtask(subtask.id, event.target.value) }}>
-                    <option value="">Unassigned</option>
-                    {members.map((member) => <option key={member.id} value={member.id}>{member.avatar_emoji}</option>)}
-                  </select>
-                  {subtask.done ? <span className="text-emerald-600">✔</span> : null}
-                </li>
-              ))}
+              {subtasks.map((subtask) => {
+                const selectedSubtaskIds = subtaskAssigneeMap.get(subtask.id) ?? []
+                const assignedNames = selectedSubtaskIds.map((memberId) => memberById.get(memberId)?.name).filter(Boolean) as string[]
+                return (
+                  <li key={subtask.id} className="grid gap-2 rounded-lg border p-2">
+                    <div className="grid grid-cols-[auto_1fr_auto] items-center gap-2">
+                      <input type="checkbox" checked={subtask.done} onChange={() => void onToggleSubtask(subtask)} />
+                      {isEditingSubtaskId === subtask.id ? (
+                        <input className="min-w-0 flex-1 rounded border px-2 py-1" value={editingSubtaskTitle} onChange={(event) => setEditingSubtaskTitle(event.target.value)} />
+                      ) : (
+                        <span className={subtask.done ? 'text-emerald-600' : ''}>{subtask.title}</span>
+                      )}
+                      {subtask.done ? <span className="text-emerald-600">✔</span> : <span className="text-slate-400">•</span>}
+                    </div>
+                    <div className="ml-6 text-xs text-slate-600">
+                      {assignedNames.length ? assignedNames.join(', ') : 'Unassigned'}
+                    </div>
+                    <div className="ml-6">
+                      <MemberAssignmentSelector
+                        members={members}
+                        selectedMemberIds={selectedSubtaskIds}
+                        onChange={(next) => { void onAssignSubtask(subtask.id, next) }}
+                        compact
+                      />
+                    </div>
+                    <div className="ml-6 flex flex-wrap gap-2">
+                      <button type="button" className="rounded bg-emerald-100 px-2 py-1 text-xs font-medium text-emerald-700" onClick={() => void onToggleSubtask(subtask)}>{subtask.done ? 'Mark open' : 'Mark complete'}</button>
+                      {isEditingSubtaskId === subtask.id ? (
+                        <button type="button" className="rounded bg-slate-800 px-2 py-1 text-xs text-white" onClick={async () => {
+                          const nextTitle = editingSubtaskTitle.trim()
+                          if (!nextTitle) return
+                          await updateSubtask(subtask.id, { title: nextTitle })
+                          setIsEditingSubtaskId(null)
+                          setEditingSubtaskTitle('')
+                        }}>Save edit</button>
+                      ) : (
+                        <button type="button" className="rounded bg-slate-200 px-2 py-1 text-xs" onClick={() => {
+                          setIsEditingSubtaskId(subtask.id)
+                          setEditingSubtaskTitle(subtask.title)
+                        }}>Edit</button>
+                      )}
+                      <button type="button" className="rounded bg-rose-100 px-2 py-1 text-xs text-rose-700" onClick={async () => {
+                        await deleteSubtask(subtask.id)
+                        setIsEditingSubtaskId((current) => current === subtask.id ? null : current)
+                      }}>Remove</button>
+                    </div>
+                  </li>
+                )
+              })}
             </ul>
             <form
               className="mt-2 flex gap-2"
               onSubmit={async (event) => {
                 event.preventDefault()
                 if (!subtaskTitle.trim()) return
-                await onAddSubtask(subtaskTitle.trim())
+                await onAddSubtask(subtaskTitle.trim(), subtaskAssigneeIds)
                 setSubtaskTitle('')
+                setSubtaskAssigneeIds([])
               }}
             >
               <input className="min-w-0 flex-1 rounded-lg border px-2 py-1" value={subtaskTitle} onChange={(event) => setSubtaskTitle(event.target.value)} placeholder="Add subtask" />
               <button type="submit" className="rounded-lg border px-2 py-1">Add</button>
             </form>
+            <div className="mt-2 rounded-lg border p-2">
+              <p className="mb-2 text-xs font-medium uppercase tracking-wide text-slate-500">Subtask assignees</p>
+              <MemberAssignmentSelector members={members} selectedMemberIds={subtaskAssigneeIds} onChange={setSubtaskAssigneeIds} compact />
+            </div>
           </div>
 
           <div className="rounded-xl border p-3">

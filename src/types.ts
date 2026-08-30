@@ -18,6 +18,11 @@ export interface Task {
   created_at: string
 }
 
+export interface TaskAssignment {
+  task_id: string
+  member_id: string
+}
+
 export interface Subtask {
   id: string
   parent_task_id: string
@@ -25,6 +30,11 @@ export interface Subtask {
   done: boolean
   assignee_id: string | null
   created_at: string
+}
+
+export interface SubtaskAssignment {
+  subtask_id: string
+  member_id: string
 }
 
 export interface Comment {

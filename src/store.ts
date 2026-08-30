@@ -18,9 +18,11 @@ export interface AppData {
   subtasks: Subtask[]
   comments: Comment[]
   animals: Animal[]
+  taskAssignments: Array<{ task_id: string; member_id: string }>
+  subtaskAssignments: Array<{ subtask_id: string; member_id: string }>
 }
 
-const TABLES = ['members', 'tasks', 'subtasks', 'comments', 'animals'] as const
+const TABLES = ['members', 'tasks', 'subtasks', 'comments', 'animals', 'task_assignees', 'subtask_assignees'] as const
 
 const toRoman = (value: number): string => {
   const numerals: Array<[number, string]> = [
@@ -61,15 +63,17 @@ const getNextFreeSlot = async () => {
 }
 
 export const fetchAppData = async (): Promise<AppData> => {
-  const [membersRes, tasksRes, subtasksRes, commentsRes, animalsRes] = await Promise.all([
+  const [membersRes, tasksRes, subtasksRes, commentsRes, animalsRes, taskAssignmentsRes, subtaskAssignmentsRes] = await Promise.all([
     supabase.from('members').select('*').order('created_at', { ascending: true }),
     supabase.from('tasks').select('*').order('created_at', { ascending: true }),
     supabase.from('subtasks').select('*').order('created_at', { ascending: true }),
     supabase.from('comments').select('*').order('created_at', { ascending: true }),
     supabase.from('animals').select('*').order('awarded_at', { ascending: true }),
+    supabase.from('task_assignees').select('*'),
+    supabase.from('subtask_assignees').select('*'),
   ])
 
-  for (const res of [membersRes, tasksRes, subtasksRes, commentsRes, animalsRes]) {
+  for (const res of [membersRes, tasksRes, subtasksRes, commentsRes, animalsRes, taskAssignmentsRes, subtaskAssignmentsRes]) {
     if (res.error) throw res.error
   }
 
@@ -79,6 +83,8 @@ export const fetchAppData = async (): Promise<AppData> => {
     subtasks: subtasksRes.data as Subtask[],
     comments: commentsRes.data as Comment[],
     animals: animalsRes.data as Animal[],
+    taskAssignments: taskAssignmentsRes.data as Array<{ task_id: string; member_id: string }>,
+    subtaskAssignments: subtaskAssignmentsRes.data as Array<{ subtask_id: string; member_id: string }>,
   }
 }
 
@@ -111,38 +117,63 @@ export const addMember = async (name: string, avatarEmoji: string) => {
 }
 
 export const removeMember = async (memberId: string) => {
-  const { error: unassignError } = await supabase
-    .from('tasks')
-    .update({ assignee_id: null })
-    .eq('assignee_id', memberId)
-  if (unassignError) throw unassignError
+  const { error: taskAssignError } = await supabase.from('task_assignees').delete().eq('member_id', memberId)
+  if (taskAssignError) throw taskAssignError
 
-  const { error: subtaskError } = await supabase
-    .from('subtasks')
-    .update({ assignee_id: null })
-    .eq('assignee_id', memberId)
-  if (subtaskError) throw subtaskError
+  const { error: subtaskAssignError } = await supabase.from('subtask_assignees').delete().eq('member_id', memberId)
+  if (subtaskAssignError) throw subtaskAssignError
 
   const { error } = await supabase.from('members').delete().eq('id', memberId)
+  if (error) throw error
+}
+
+export const setTaskAssignees = async (taskId: string, memberIds: string[]) => {
+  const uniqueMemberIds = [...new Set(memberIds.filter(Boolean))]
+  const { error: deleteError } = await supabase.from('task_assignees').delete().eq('task_id', taskId)
+  if (deleteError) throw deleteError
+
+  if (!uniqueMemberIds.length) return
+
+  const { error } = await supabase.from('task_assignees').insert(
+    uniqueMemberIds.map((memberId) => ({ task_id: taskId, member_id: memberId })),
+  )
+  if (error) throw error
+}
+
+export const setSubtaskAssignees = async (subtaskId: string, memberIds: string[]) => {
+  const uniqueMemberIds = [...new Set(memberIds.filter(Boolean))]
+  const { error: deleteError } = await supabase.from('subtask_assignees').delete().eq('subtask_id', subtaskId)
+  if (deleteError) throw deleteError
+
+  if (!uniqueMemberIds.length) return
+
+  const { error } = await supabase.from('subtask_assignees').insert(
+    uniqueMemberIds.map((memberId) => ({ subtask_id: subtaskId, member_id: memberId })),
+  )
   if (error) throw error
 }
 
 export const addTask = async (input: {
   title: string
   description: string
-  assigneeId: string | null
+  assigneeIds: string[]
   emoji: string
 }) => {
   const mapSlot = await getNextFreeSlot()
-  const { error } = await supabase.from('tasks').insert({
+  const { data, error } = await supabase.from('tasks').insert({
     title: input.title,
     description: input.description,
-    assignee_id: input.assigneeId,
     emoji: input.emoji,
     status: 'open',
     map_slot: mapSlot,
-  })
+  }).select('id').single()
   if (error) throw error
+
+  if (!data?.id || !input.assigneeIds.length) return
+
+  const rows = input.assigneeIds.map((memberId) => ({ task_id: data.id, member_id: memberId }))
+  const { error: assignmentError } = await supabase.from('task_assignees').insert(rows)
+  if (assignmentError) throw assignmentError
 }
 
 export const updateTask = async (
@@ -155,13 +186,30 @@ export const updateTask = async (
     emoji: string
   }>,
 ) => {
-  const { error } = await supabase.from('tasks').update(patch).eq('id', taskId)
+  const { error } = await supabase.from('tasks').update({
+    title: patch.title,
+    description: patch.description,
+    status: patch.status,
+    emoji: patch.emoji,
+  }).eq('id', taskId)
   if (error) throw error
 }
 
 export const deleteTask = async (taskId: string) => {
+  const { error: taskAssignmentError } = await supabase.from('task_assignees').delete().eq('task_id', taskId)
+  if (taskAssignmentError) throw taskAssignmentError
+
   const { error: commentsError } = await supabase.from('comments').delete().eq('task_id', taskId)
   if (commentsError) throw commentsError
+
+  const { data: subtaskRows, error: subtaskLookupError } = await supabase.from('subtasks').select('id').eq('parent_task_id', taskId)
+  if (subtaskLookupError) throw subtaskLookupError
+
+  const subtaskIds = (subtaskRows ?? []).map((subtask: { id: string }) => subtask.id)
+  if (subtaskIds.length) {
+    const { error: subtaskAssignmentError } = await supabase.from('subtask_assignees').delete().in('subtask_id', subtaskIds)
+    if (subtaskAssignmentError) throw subtaskAssignmentError
+  }
 
   const { error: subtasksError } = await supabase.from('subtasks').delete().eq('parent_task_id', taskId)
   if (subtasksError) throw subtasksError
@@ -170,13 +218,26 @@ export const deleteTask = async (taskId: string) => {
   if (error) throw error
 }
 
-export const addSubtask = async (taskId: string, title: string, assigneeId: string | null) => {
-  const { error } = await supabase.from('subtasks').insert({
+export const addSubtask = async (taskId: string, title: string, assigneeIds: string[] = []) => {
+  const { data, error } = await supabase.from('subtasks').insert({
     parent_task_id: taskId,
     title,
-    assignee_id: assigneeId,
     done: false,
-  })
+  }).select('id').single()
+  if (error) throw error
+
+  if (!data?.id || !assigneeIds.length) return
+
+  const rows = assigneeIds.map((memberId) => ({ subtask_id: data.id, member_id: memberId }))
+  const { error: assignmentError } = await supabase.from('subtask_assignees').insert(rows)
+  if (assignmentError) throw assignmentError
+}
+
+export const deleteSubtask = async (subtaskId: string) => {
+  const { error: assignmentError } = await supabase.from('subtask_assignees').delete().eq('subtask_id', subtaskId)
+  if (assignmentError) throw assignmentError
+
+  const { error } = await supabase.from('subtasks').delete().eq('id', subtaskId)
   if (error) throw error
 }
 
@@ -184,7 +245,10 @@ export const updateSubtask = async (
   subtaskId: string,
   patch: Partial<{ title: string; done: boolean; assignee_id: string | null }>,
 ) => {
-  const { error } = await supabase.from('subtasks').update(patch).eq('id', subtaskId)
+  const { error } = await supabase.from('subtasks').update({
+    title: patch.title,
+    done: patch.done,
+  }).eq('id', subtaskId)
   if (error) throw error
 }
 
@@ -197,10 +261,7 @@ export const addComment = async (taskId: string, authorId: string | null, body: 
   if (error) throw error
 }
 
-export const completeTaskAndAwardAnimal = async (taskId: string, ownerId: string): Promise<Animal> => {
-  const { error: taskError } = await supabase.from('tasks').update({ status: 'complete' }).eq('id', taskId)
-  if (taskError) throw taskError
-
+export const awardAnimalForOwner = async (ownerId: string): Promise<Animal> => {
   const { count, error: countError } = await supabase
     .from('animals')
     .select('*', { count: 'exact', head: true })
@@ -225,4 +286,11 @@ export const completeTaskAndAwardAnimal = async (taskId: string, ownerId: string
 
   if (error) throw error
   return data as Animal
+}
+
+export const completeTaskAndAwardAnimal = async (taskId: string, ownerId: string): Promise<Animal> => {
+  const { error: taskError } = await supabase.from('tasks').update({ status: 'complete' }).eq('id', taskId)
+  if (taskError) throw taskError
+
+  return awardAnimalForOwner(ownerId)
 }
